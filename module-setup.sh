@@ -13,7 +13,7 @@ depends() {
 
 # called by dracut
 install() {
-	inst_multiple mountpoint findmnt readlink
+	inst_multiple cp rm grep sed findmnt mount umount
 
 	inst_script "$moddir"/systemd-repart-dracut /usr/bin/systemd-repart-dracut
 

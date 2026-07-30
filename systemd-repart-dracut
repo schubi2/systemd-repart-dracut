@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: Copyright 2024 SUSE LLC
 set -e
-shopt -s nullglob
 
 unset "${!LC_@}"
 LANG="C.utf8"
@@ -13,60 +12,154 @@ log_info()
 	echo "$@"
 }
 
-err()
+log_err()
 {
 	echo "Error: $*" >&2
 	echo "Error: $*"
+}
+
+err()
+{
+	log_err "$*"
 	exit 1
+}
+
+# These files live in /run, which survives the switch root, so they must be
+# removed on every exit path and not only on the successful one
+cleanup()
+{
+	# Never let the cleanup itself change the exit status of the script
+	rm -f /run/fstab.dracut /run/mount.before /run/mount.after || :
 }
 
 ####### main #######
 
 [ -e /etc/initrd-release ] || err "No initrd environment"
 
+# Set when an error that is not reported by the exit code of systemd-repart occurs
+failed=0
+
+trap cleanup EXIT
+
 # Copy this file so that we can use it to mount all partitions later
-cp /sysroot/etc/fstab /run/fstab.dracut
+cp /sysroot/etc/fstab /run/fstab.dracut || err "Failed to copy /sysroot/etc/fstab"
+
 bind_etc=false
-# Only MicroOS has /etc bind mount
-if grep -q "/etc" /sysroot/etc/fstab; then
+# Only MicroOS has /etc bind mount. Match /etc as the mountpoint field only, a
+# substring match would also catch comments and paths like /etc-backup
+etc_entry='^[^#]*[[:space:]]/etc([[:space:]]|$)'
+if grep -Eq "$etc_entry" /sysroot/etc/fstab; then
 	bind_etc=true
-    # Skip /etc bind mount, it will be done manually later
-	sed -e "/\/etc/d" -i /run/fstab.dracut
+	# Skip /etc bind mount, it will be done manually later. Use % as address
+	# delimiter, the expression above contains slashes
+	sed -E "\\%$etc_entry%d" -i /run/fstab.dracut ||
+		err "Failed to remove the /etc entry from /run/fstab.dracut"
 fi
 
 # Ensure that all mountpoints are mounted so that systemd-repart CopyFiles work
 # properly, because only /sysroot is mounted when systemd-repart-dracut runs
-echo "Mounting all filesystems from fstab"
-mount > /run/mount.before
-mount --all --target-prefix /sysroot --fstab /run/fstab.dracut
-mount > /run/mount.after
+log_info "Mounting all filesystems from fstab"
+# Only record the mountpoints: comparing whole mount entries would report a
+# filesystem whose options changed in the meantime as newly mounted
+findmnt -rno TARGET > /run/mount.before ||
+	err "Failed to record the mountpoints before mounting"
+# Don't abort on failure, the filesystems that have been mounted must still be
+# unmounted below or the initrd will break later on
+mount_ret=0
+mount --all --target-prefix /sysroot --fstab /run/fstab.dracut || mount_ret=$?
+# Without this list the unmount loop below has nothing to compare against and
+# would silently unmount nothing. There is no safe way to guess what has just
+# been mounted, so report the leftover mounts instead of failing quietly
+findmnt -rno TARGET > /run/mount.after ||
+	err "Failed to record the mountpoints after mounting, the filesystems from fstab are left mounted"
 
-# In MicroOS, /etc is bind mounted to make it writable as the rest of the
-# subvol is read-only. mount --target-prefix <DIR> doesn't work for bind mount,
-# as <DIR> is not prefixed to the target of the bind mount. Do it manually to
-# ensure /etc is writable 
-if [[ $external_etc == "true" ]]; then
-	mount --bind /sysroot/etc /sysroot/etc
-    mount -o remount,rw /sysroot/etc
-# In case /sysroot is not read-write, remount, this is the case for Tumbleweed
-elif ! [ -w /sysroot/etc ]; then
-    mount -o remount,rw /sysroot
+etc_bind_mounted=false
+sysroot_remounted=false
+repart_ret=0
+
+if [ "$mount_ret" -ne 0 ]; then
+	# Running systemd-repart now would copy files from a partially mounted
+	# system, writing incomplete content to the new partitions
+	log_err "Failed to mount all the filesystems from fstab (exit code $mount_ret), skipping systemd-repart"
+	failed=1
+else
+	# In MicroOS, /etc is bind mounted to make it writable as the rest of the
+	# subvol is read-only. mount --target-prefix <DIR> doesn't work for bind
+	# mount, as <DIR> is not prefixed to the target of the bind mount. Do it
+	# manually to ensure /etc is writable
+	if [[ $bind_etc == "true" ]]; then
+		if mount --bind /sysroot/etc /sysroot/etc; then
+			etc_bind_mounted=true
+			if ! mount -o remount,rw /sysroot/etc; then
+				log_err "Failed to remount /sysroot/etc read-write"
+				failed=1
+			fi
+		else
+			log_err "Failed to bind mount /sysroot/etc"
+			failed=1
+		fi
+	# In case /sysroot is not read-write, remount, this is the case for Tumbleweed
+	elif ! [ -w /sysroot/etc ]; then
+		if mount -o remount,rw /sysroot; then
+			sysroot_remounted=true
+		else
+			log_err "Failed to remount /sysroot read-write"
+			failed=1
+		fi
+	fi
+
+	log_info "Reparting with systemd-repart:"
+	# Don't abort on failure, the filesystems mounted above must be unmounted
+	# first or the initrd will break later on
+	/usr/bin/systemd-repart --dry-run=no --append-fstab=auto --generate-fstab=/etc/fstab || repart_ret=$?
+	if [ "$repart_ret" -eq 0 ]; then
+		log_info "Repartition completed"
+	else
+		log_err "systemd-repart failed with exit code $repart_ret"
+	fi
 fi
 
-log_info "Reparting with systemd-repart:"
-/usr/bin/systemd-repart --dry-run=no --append-fstab=auto --generate-fstab=/etc/fstab
-log_info "Repartition completed"
-
-# Unmount all devices and subvolumes that we mounted above
-echo "Unmounting all mounts inside"
-grep -Fxvf /run/mount.before /run/mount.after | cut -d" " -f 3 | while read -r mountpoint; do
-    # This shouldn't be needed, but it's just to be sure we don't unmount
-    # anything unnecessary
-	if [[ "$mountpoint" == /sysroot/* ]]; then
-		umount "$mountpoint"
+# Unmount all devices and subvolumes that we mounted above. A single umount
+# failure must not stop us from unmounting the remaining ones, otherwise the
+# initrd will break later on. Report the failures at the end.
+log_info "Unmounting all mounts inside /sysroot"
+umount_failed=()
+mapfile -t mountpoints < <(grep -Fxvf /run/mount.before /run/mount.after)
+# Iterate in reverse order, so that nested mounts are unmounted first
+for (( i = ${#mountpoints[@]} - 1; i >= 0; i-- )); do
+	# findmnt escapes the characters that are not printable, spaces included
+	mountpoint="${mountpoints[i]//\\x20/ }"
+	# All of these have been mounted by the mount --all above, so unmount the
+	# ones outside of /sysroot too: --target-prefix is not applied to the
+	# target of bind mounts
+	if ! umount "$mountpoint"; then
+		umount_failed+=("$mountpoint")
+		failed=1
 	fi
 done
 
-if [[ $external_etc == "true" ]]; then
-    umount /sysroot/etc
+if [[ $etc_bind_mounted == "true" ]]; then
+	if ! umount /sysroot/etc; then
+		umount_failed+=("/sysroot/etc")
+		failed=1
+	fi
+fi
+
+# Leave /sysroot as we found it, it is remounted read-write after the switch
+# root when fstab says so
+if [[ $sysroot_remounted == "true" ]]; then
+	if ! mount -o remount,ro /sysroot; then
+		log_err "Failed to remount /sysroot read-only"
+		failed=1
+	fi
+fi
+
+if [ "${#umount_failed[@]}" -ne 0 ]; then
+	log_err "Failed to unmount the following filesystems: ${umount_failed[*]}"
+fi
+
+if [ "$failed" -ne 0 ]; then
+	exit 1
+elif [ "$repart_ret" -ne 0 ]; then
+	exit "$repart_ret"
 fi
